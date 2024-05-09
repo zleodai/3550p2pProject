@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use tokio::{fs, io::AsyncBufReadExt, sync::mpsc};
 use rand::prelude::*;
-use async_std::fs::File;
+use async_std::fs::File as Async_File;
+use std::fs::File;
+use std::fs as regular_fs;
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync + 'static>>;
 type CardsInHand = Vec<Card>;
@@ -26,6 +28,12 @@ static PEER_ID: Lazy<PeerId> = Lazy::new(|| PeerId::from(KEYS.public()));
 static TOPIC: Lazy<Topic> = Lazy::new(|| Topic::new("articles"));
 
 static PATH_NAME: Lazy<String> = Lazy::new(|| format!("./Cards_In_Hand_{}.json", PEER_ID.to_string()));
+static ENEMY_PATH_NAME: Lazy<String> = Lazy::new(|| format!("./Enemy_Visible_Cards{}.json", PEER_ID.to_string()));
+static STATUS_PATH: Lazy<String> = Lazy::new(|| format!("./Status_{}.json", PEER_ID.to_string()));
+static ENEMY_STATUS_PATH: Lazy<String> = Lazy::new(|| format!("./Enemy_Status_{}.json", PEER_ID.to_string()));
+static ENEMY_FOUND_PATH: Lazy<String> = Lazy::new(|| format!("./Enemy_Found{}.json", PEER_ID.to_string()));
+static STAND_PATH: Lazy<String> = Lazy::new(|| format!("./Stand{}.json", PEER_ID.to_string()));
+static ENEMY_STAND_PATH: Lazy<String> = Lazy::new(|| format!("./Enemy_Stand{}.json", PEER_ID.to_string()));
 
 #[derive(Debug, Serialize, Deserialize)]
 struct Card {
@@ -49,6 +57,7 @@ struct ListRequest {
 struct ListResponse {
     mode: ListMode,
     data: CardsInHand,
+    status: i64,
     receiver: String,
 }
 
@@ -71,13 +80,14 @@ impl NetworkBehaviourEventProcess<FloodsubEvent> for CardBehavior {
             FloodsubEvent::Message(msg) => {
                 if let Ok(resp) = serde_json::from_slice::<ListResponse>(&msg.data) {
                     if resp.receiver == PEER_ID.to_string() {
-                        info!("Response from {}:", msg.source);
-                        resp.data.iter().for_each(|r| info!("{:?}", r));
+                        update_enemy_cards(&resp.data);
+                        update_enemy_status_json(resp.status);
+                        update_enemy_found_json(1);
                     }
                 } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
                     match req.mode {
                         ListMode::ALL => {
-                            info!("Received ALL req: {:?} from {:?}", req, msg.source);
+                            //info!("Received ALL req: {:?} from {:?}", req, msg.source);
                             respond_with_public_cards(
                                 self.response_sender.clone(),
                                 msg.source.to_string(),
@@ -85,7 +95,7 @@ impl NetworkBehaviourEventProcess<FloodsubEvent> for CardBehavior {
                         }
                         ListMode::One(ref peer_id) => {
                             if peer_id == &PEER_ID.to_string() {
-                                info!("Received req: {:?} from {:?}", req, msg.source);
+                                //info!("Received req: {:?} from {:?}", req, msg.source);
                                 respond_with_public_cards(
                                     self.response_sender.clone(),
                                     msg.source.to_string(),
@@ -102,12 +112,14 @@ impl NetworkBehaviourEventProcess<FloodsubEvent> for CardBehavior {
 
 fn respond_with_public_cards(sender: mpsc::UnboundedSender<ListResponse>, receiver: String) {
     tokio::spawn(async move {
+        let score: i64 = read_local_status().await.expect("Get Score");
         match read_local_cards().await {
             Ok(cards) => {
                 let resp = ListResponse {
                     mode: ListMode::ALL,
                     receiver,
                     data: cards.into_iter().filter(|r| r.revealed).collect(),
+                    status: score
                 };
                 if let Err(e) = sender.send(resp) {
                     error!("error sending response via channel, {}", e);
@@ -138,7 +150,7 @@ impl NetworkBehaviourEventProcess<MdnsEvent> for CardBehavior {
     }
 }
 
-async fn create_new_card(name: &str) -> Result<()> {
+async fn create_new_card() -> Result<()> {
     let mut local_cards = read_local_cards().await?;
     let mut rng = rand::thread_rng();
     let random_id: f64 = rng.gen();
@@ -149,6 +161,7 @@ async fn create_new_card(name: &str) -> Result<()> {
         floored_id = 51
     }
     let input_id = floored_id as usize;
+    let name = get_card_string_from_id(floored_id).await?;
 
     local_cards.push(Card {
         id: input_id,
@@ -173,26 +186,162 @@ async fn reveal_card(id: usize) -> Result<()> {
 }
 
 async fn read_local_cards() -> Result<CardsInHand> {
-    let STORAGE_FILE_PATH: &str = &*PATH_NAME;
-    let content = fs::read(STORAGE_FILE_PATH).await?;
+    let storage_file_path: &str = &*PATH_NAME;
+    let content = fs::read(storage_file_path).await?;
     let result = serde_json::from_slice(&content)?;
     Ok(result)
 }
 
 async fn write_local_cards(cards: &CardsInHand) -> Result<()> {
-    let STORAGE_FILE_PATH: &str = &*PATH_NAME;
+    let storage_file_path: &str = &*PATH_NAME;
     let json = serde_json::to_string(&cards)?;
-    fs::write(STORAGE_FILE_PATH, json).await?;
+    fs::write(storage_file_path, json).await?;
     Ok(())
 }
 
-async fn create_local_cards(cards: &CardsInHand) -> Result<()> {
-    let STORAGE_FILE_PATH: &str = &*PATH_NAME;
-    let json = serde_json::to_string(&cards)?;
-    let _file = File::create(STORAGE_FILE_PATH).await?;
-    fs::write(STORAGE_FILE_PATH, json).await?;
+async fn create_new_cards_json() -> Result<()> {
+    let storage_file_path: &str = &*PATH_NAME;
+    let _file = Async_File::create(storage_file_path).await?;
+    fs::write(storage_file_path, b"[]").await?;
     Ok(())
 }
+
+async fn read_local_status() -> Result<i64> {
+    let storage_file_path: &str = &*STATUS_PATH;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+async fn update_status_json(sum: i64) -> Result<()> {
+    let storage_file_path: &str = &*STATUS_PATH;
+    let _file = Async_File::create(storage_file_path).await?;
+    fs::write(storage_file_path, sum.to_string()).await?;
+    Ok(())
+}
+
+async fn create_player_stand() -> Result<()> {
+    let storage_file_path: &str = &*STAND_PATH;
+    let _file = Async_File::create(storage_file_path).await?;
+    let json = serde_json::to_string(&0);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+    Ok(())
+}
+
+async fn update_player_stand(x: i64) -> Result<()> {
+    let storage_file_path: &str = &*STAND_PATH;
+    let _file = Async_File::create(storage_file_path).await?;
+    let json = serde_json::to_string(&x);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+    Ok(())
+}
+
+async fn read_player_stand() -> Result<i64> {
+    let storage_file_path: &str = &*STAND_PATH;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+async fn read_local_enemy_status() -> Result<i64> {
+    let storage_file_path: &str = &*ENEMY_STATUS_PATH;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+async fn read_enemy_cards() -> Result<CardsInHand> {
+    let storage_file_path: &str = &*ENEMY_PATH_NAME;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+async fn read_enemy_found() -> Result<i64> {
+    let storage_file_path: &str = &*ENEMY_FOUND_PATH;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+fn update_enemy_status_json(sum: i64) {
+    let storage_file_path: &str = &*ENEMY_STATUS_PATH;
+    let _file = File::create(storage_file_path);
+    regular_fs::write(storage_file_path, sum.to_string());
+}
+
+fn update_enemy_cards(cards: &CardsInHand) {
+    let storage_file_path: &str = &*ENEMY_PATH_NAME;
+    let _file = File::create(storage_file_path);
+    let json = serde_json::to_string(&cards);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+}
+
+fn update_enemy_found_json(x: i64){
+    let storage_file_path: &str = &*ENEMY_FOUND_PATH;
+    let _file = File::create(storage_file_path);
+    let json = serde_json::to_string(&x);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+}
+
+fn update_enemy_stand_json(x: i64){
+    let storage_file_path: &str = &*ENEMY_STAND_PATH;
+    let _file = File::create(storage_file_path);
+    let json = serde_json::to_string(&x);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+}
+
+async fn create_enemy_cards_json() -> Result<()> {
+    let storage_file_path: &str = &*ENEMY_PATH_NAME;
+    let _file = File::create(storage_file_path);
+    fs::write(storage_file_path, b"[]");
+    Ok(())
+}
+
+async fn create_enemy_status_json() -> Result<()> {
+    let storage_file_path: &str = &*ENEMY_STATUS_PATH;
+    let _file = File::create(storage_file_path);
+    fs::write(storage_file_path, b"0");
+    Ok(())
+}
+
+async fn create_enemy_found_json() -> Result<()> {
+    let storage_file_path: &str = &*ENEMY_FOUND_PATH;
+    let _file = File::create(storage_file_path);
+    let json = serde_json::to_string(&0);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+    Ok(())
+}
+
+async fn create_enemy_stand() -> Result<()> {
+    let storage_file_path: &str = &*ENEMY_STAND_PATH;
+    let _file = File::create(storage_file_path);
+    let json = serde_json::to_string(&0);
+    let json_string = json.unwrap_or_else(|err| {
+        "default value".to_string()
+    });
+    regular_fs::write(storage_file_path, json_string);
+    Ok(())
+}
+
 
 #[tokio::main]
 async fn main() {
@@ -241,11 +390,13 @@ async fn main() {
     .expect("swarm can be started");
 
     loop {
+        info!("\n\n\n\n\n");
+
         let evt = {
             tokio::select! {
                 line = stdin.next_line() => Some(EventType::Input(line.expect("can get line").expect("can read line from stdin"))),
                 response = response_rcv.recv() => Some(EventType::Response(response.expect("response exists"))),
-                event = swarm.select_next_some() => {
+                _event = swarm.select_next_some() => {
                     //info!("Unhandled Swarm Event: {:?}", event);
                     None
                 },
@@ -263,14 +414,91 @@ async fn main() {
                 }
                 EventType::Input(line) => match line.as_str() {
                     "ls p" => handle_list_peers(&mut swarm).await,
-                    cmd if cmd.starts_with("ls b") => handle_list_cards(cmd, &mut swarm).await,
-                    cmd if cmd.starts_with("create b") => handle_create_card(cmd).await,
-                    cmd if cmd.starts_with("reveal b") => handle_reveal_card(cmd).await,
+                    cmd if cmd.starts_with("see cards") => handle_list_cards(cmd, &mut swarm).await,
+                    cmd if cmd.starts_with("get card") => handle_create_card().await,
+                    cmd if cmd.starts_with("draw card") => handle_create_card().await,
+                    cmd if cmd.starts_with("show card") => handle_reveal_card(cmd).await,
+                    cmd if cmd.starts_with("restart") => restart_game().await,
+                    cmd if cmd.starts_with("start") => handle_ping_enemy(&mut swarm).await,
+                    cmd if cmd.starts_with("ping") => handle_ping_enemy(&mut swarm).await,
+                    cmd if cmd.starts_with("stand") => handle_stand().await,
                     _ => error!("unknown command"),
                 },
             }
         }
+
+        let score = get_score().await.expect("Get Score");
+        update_status_json(score).await.expect("Update Score");
+        let status = read_local_status().await.expect("Get Status");
+
+        let enemy_found = read_enemy_found().await.expect("Get Enemy Found");
+        if enemy_found == 1 {
+            info!("Game started");
+            
+            let mut cards_list = HashSet::new();
+            let local_cards = read_local_cards().await.expect("Get Cards"); 
+
+            for card in local_cards{
+                cards_list.insert(card.name);
+            }
+
+            info!("Your cards: ");
+
+            cards_list.iter().for_each(|card_name| info!("{}", card_name));
+
+            info!("\n\n");
+
+            info!("Enemy visible cards: ");
+
+            let mut enemy_cards_list = HashSet::new();
+            let enemy_cards = read_enemy_cards().await.expect("Get Cards"); 
+
+            for card in enemy_cards{
+                enemy_cards_list.insert(card.name);
+            }
+
+            enemy_cards_list.iter().for_each(|card_name| info!("{}", card_name));
+
+            let blackjack_check: bool = check_if_blackjack().await.expect("Get Blackjack");
+            if blackjack_check {
+                info!("You won! Type restart to restart the game (Both Players must restart)");
+            }
+    
+            let bust_check: bool = check_if_bust().await.expect("Get Bust");
+            if bust_check {
+                info!("You busted! Type restart to restart the game (Both Players must restart)");
+            }
+
+            let enemy_score: i64 = read_local_enemy_status().await.expect("Get Enemy Score");
+            if enemy_score > 21 {
+                info!("Enemy Busted! You Win! Type restart to restart the game (Both Players must restart)")
+            } else if enemy_score == 21 {
+                info!("Enemy got won! Type restart to restart the game (Both Players must restart)")
+            }
+
+            let stand_value = read_player_stand().await.expect("Get Stand Value");
+
+            if !bust_check && !blackjack_check && stand_value == 0 {
+                info!("Say 'draw card' to draw a card");
+                info!("Or Say 'stand' to stand");
+                info!("\n");
+            } else if (!bust_check && !blackjack_check) {
+                info!("You stand. Waiting for player to make a move")
+            }
+            info!("Say 'ping' twice to see enemy player action")
+        } else {
+            info!("Could not find another player\n\n");
+            info!("Say 'start' twice to start the game when another player is connected");
+        }
     }
+}
+
+async fn handle_stand() {
+    update_player_stand(1).await.expect("Updating Stand");
+}
+
+async fn handle_ping_enemy(swarm: &mut Swarm<CardBehavior>) {
+    let _ = ping_enemy(swarm).await.expect("Pinged Enemy");
 }
 
 async fn handle_list_peers(swarm: &mut Swarm<CardBehavior>) {
@@ -284,7 +512,12 @@ async fn handle_list_peers(swarm: &mut Swarm<CardBehavior>) {
 }
 
 async fn handle_list_cards(cmd: &str, swarm: &mut Swarm<CardBehavior>) {
-    let rest = cmd.strip_prefix("ls r");
+    let rest = cmd.strip_prefix("see cards");
+    let rest_str = match rest {
+        Some(s) => s,
+        None => "Default Value",
+    };
+    info!("Input:{}", rest_str);
     match rest {
         Some("all") => {
             let req = ListRequest {
@@ -318,18 +551,10 @@ async fn handle_list_cards(cmd: &str, swarm: &mut Swarm<CardBehavior>) {
     };
 }
 
-async fn handle_create_card(cmd: &str) {
-    if let Some(rest) = cmd.strip_prefix("create b ") {
-        let elements: Vec<&str> = rest.split("|").collect();
-        if elements.len() == 0 {
-            info!("too few arguments - Format: name");
-        } else {
-            let name = elements.get(0).expect("card is there");
-            if let Err(e) = create_new_card(name).await {
-                error!("error creating card: {}", e);
-            };
-        }
-    }
+async fn handle_create_card() {
+    if let Err(e) = create_new_card().await {
+        error!("error creating card: {}", e);
+    };
 }
 
 async fn handle_reveal_card(cmd: &str) {
@@ -347,45 +572,183 @@ async fn handle_reveal_card(cmd: &str) {
     }
 }
 
+async fn restart_game() {
+    let _ = start_up_game().await;
+}
+
 async fn start_up_game() -> Result<()> {
-    let mut local_cards = CardsInHand::new();
-    let mut rng = rand::thread_rng();
-    let mut random_id: f64 = rng.gen();
-    let mut floored_id = (random_id * 52.0) as i64;
-    if floored_id >= 52 {
-        floored_id = 51
-    }
-    let mut input_id = floored_id as usize;
-    let name: String = get_card_string_from_id(floored_id).await?;
+    create_new_cards_json().await?;
+    create_new_card().await?;
+    create_new_card().await?;
+    let local_cards = read_local_cards().await?; 
+    reveal_card(local_cards[0].id).await?;
+    let score = get_score().await?;
+    update_status_json(score).await?;
 
-    local_cards.push(Card {
-        id: input_id,
-        name: name.to_owned(),
-        revealed: false,
-    });
-
-    random_id = rng.gen();
-    floored_id = (random_id * 52.0) as i64;
-    if floored_id >= 52 {
-        floored_id = 51
-    }
-    input_id = floored_id as usize;
-    let name = get_card_string_from_id(floored_id).await?;
-
-    local_cards.push(Card {
-        id: input_id,
-        name: name.to_owned(),
-        revealed: false,
-    });
-
-    create_local_cards(&local_cards).await?;
+    create_player_stand().await?;
+    update_player_stand(0).await?;
     
+    create_enemy_cards_json().await.expect("Create Enemy Cards Json");
+    create_enemy_status_json().await.expect("Create Enemy Status");
+    create_enemy_found_json().await.expect("Create Enemy Found");
+    create_enemy_stand().await.expect("Create Enemy Stand");
+
     Ok(())
 }
 
 async fn get_card_string_from_id(cmd: i64) -> Result<String> {
-    let card_id: i64 = cmd.try_into().unwrap();
+    let mut card_id: i64 = cmd.try_into().unwrap();
+    let suit_id: i64 = card_id / 13;
+    card_id = card_id % 13;
 
+    let mut card_str: &str = "";
+    let mut suit_str: &str = "";
 
-    Ok("Test".to_string())
+    if card_id == 0 {
+        card_str = "Ace ";
+    } else if card_id == 1 {
+        card_str = "Two ";
+    } else if card_id == 2 {
+        card_str = "Three ";
+    } else if card_id == 3 {
+        card_str = "Four ";
+    } else if card_id == 4 {
+        card_str = "Five ";
+    } else if card_id == 5 {
+        card_str = "Six ";
+    } else if card_id == 6 {
+        card_str = "Seven ";
+    } else if card_id == 7 {
+        card_str = "Eight ";
+    } else if card_id == 8 {
+        card_str = "Nine ";
+    } else if card_id == 9 {
+        card_str = "Ten ";
+    } else if card_id == 10 {
+        card_str = "Jack ";
+    } else if card_id == 11 {
+        card_str = "Queen ";
+    } else {
+        card_str = "King ";
+    }
+
+    if suit_id == 0 {
+        suit_str = "Spades";
+    } else if suit_id == 1 {
+        suit_str = "Cloves";
+    } else if suit_id == 2 {
+        suit_str = "Hearts";
+    } else {
+        suit_str = "Diamonds";
+    }
+
+    let card_name: String = card_str.to_owned() + suit_str;
+
+    Ok(card_name)
+}
+
+async fn get_card_value_from_id(cmd: i64) -> Result<i64> {
+    let mut card_id: i64 = cmd.try_into().unwrap();
+    card_id = card_id % 13;
+
+    Ok(card_id)
+}
+
+async fn check_if_blackjack() -> Result<bool> {
+    let local_cards = read_local_cards().await?; 
+    let mut total_sum: i64 = 0;
+    let mut ace_count: i64 = 0;
+    for item in local_cards{
+        let mut card_value = get_card_value_from_id(item.id as i64).await?;
+        if card_value >= 10 {
+            card_value = 10;
+        } else if card_value == 0{
+            ace_count += 1;
+            card_value += 1;
+        } else {
+            card_value += 1;
+        }
+        total_sum += card_value;
+    }
+
+    let mut success: bool = false;
+    if total_sum == 21 {
+        success = true;
+    }
+    while ace_count > 0 {
+        total_sum += 10;
+        if total_sum == 21{
+            ace_count = 0;
+            success = true;
+        }
+        ace_count -= 1;
+    }
+
+    Ok(success)
+}
+
+async fn check_if_bust() -> Result<bool> {
+    let local_cards = read_local_cards().await?; 
+    let mut total_sum: i64 = 0;
+    for item in local_cards{
+        let mut card_value = get_card_value_from_id(item.id as i64).await?;
+        if card_value >= 10 {
+            card_value = 10;
+        } else if card_value == 0{
+            card_value = 1;
+        } else {
+            card_value += 1;
+        }
+        total_sum += card_value;
+    }
+
+    let mut bust: bool = false;
+    if total_sum > 21 {
+        bust = true;
+    }
+    Ok(bust)
+}
+
+async fn get_score() -> Result<i64> {
+    let local_cards = read_local_cards().await?; 
+    let mut total_sum: i64 = 0;
+    let mut ace_count: i64 = 0;
+    for item in local_cards{
+        let mut card_value = get_card_value_from_id(item.id as i64).await?;
+        if card_value >= 10 {
+            card_value = 10;
+        } else if card_value == 0{
+            ace_count += 1;
+            card_value += 1;
+        } else {
+            card_value += 1;
+        }
+        total_sum += card_value;
+    }
+
+    while ace_count > 0 && total_sum <= 11{
+        total_sum += 10;
+        if total_sum == 21{
+            ace_count = 0;
+        }
+        ace_count -= 1;
+    }
+    
+    Ok(total_sum)
+}
+
+async fn ping_enemy(swarm: &mut Swarm<CardBehavior>) -> Result<()> {
+    let nodes = swarm.behaviour().mdns.discovered_nodes();
+    let unique_peers: HashSet<_> = nodes.map(|&peer| peer.clone()).collect();
+    unique_peers.iter().for_each(|peer| {
+        let req = ListRequest {
+            mode: ListMode::One(peer.to_string().to_owned()),
+        };
+        let json = serde_json::to_string(&req).expect("can jsonify request");
+        swarm
+            .behaviour_mut()
+            .floodsub
+            .publish(TOPIC.clone(), json.as_bytes());
+    });
+    Ok(())
 }
