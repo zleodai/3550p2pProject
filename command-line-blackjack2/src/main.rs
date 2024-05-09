@@ -58,6 +58,7 @@ struct ListResponse {
     mode: ListMode,
     data: CardsInHand,
     status: i64,
+    stand: i64,
     receiver: String,
 }
 
@@ -83,6 +84,7 @@ impl NetworkBehaviourEventProcess<FloodsubEvent> for CardBehavior {
                         update_enemy_cards(&resp.data);
                         update_enemy_status_json(resp.status);
                         update_enemy_found_json(1);
+                        update_enemy_stand_json(resp.stand);
                     }
                 } else if let Ok(req) = serde_json::from_slice::<ListRequest>(&msg.data) {
                     match req.mode {
@@ -113,13 +115,15 @@ impl NetworkBehaviourEventProcess<FloodsubEvent> for CardBehavior {
 fn respond_with_public_cards(sender: mpsc::UnboundedSender<ListResponse>, receiver: String) {
     tokio::spawn(async move {
         let score: i64 = read_local_status().await.expect("Get Score");
+        let stand: i64 = read_player_stand().await.expect("Get Stand");
         match read_local_cards().await {
             Ok(cards) => {
                 let resp = ListResponse {
                     mode: ListMode::ALL,
                     receiver,
                     data: cards.into_iter().filter(|r| r.revealed).collect(),
-                    status: score
+                    status: score,
+                    stand: stand
                 };
                 if let Err(e) = sender.send(resp) {
                     error!("error sending response via channel, {}", e);
@@ -265,6 +269,13 @@ async fn read_enemy_cards() -> Result<CardsInHand> {
 
 async fn read_enemy_found() -> Result<i64> {
     let storage_file_path: &str = &*ENEMY_FOUND_PATH;
+    let content = fs::read(storage_file_path).await?;
+    let result = serde_json::from_slice(&content)?;
+    Ok(result)
+}
+
+async fn read_enemy_stand() -> Result<i64> {
+    let storage_file_path: &str = &*ENEMY_STAND_PATH;
     let content = fs::read(storage_file_path).await?;
     let result = serde_json::from_slice(&content)?;
     Ok(result)
@@ -477,18 +488,37 @@ async fn main() {
             }
 
             let stand_value = read_player_stand().await.expect("Get Stand Value");
+            let enemy_stand_value = read_enemy_stand().await.expect("Get Enemy Stand Value");
 
-            if !bust_check && !blackjack_check && stand_value == 0 {
+            let mut stand_check: bool = false;
+            if stand_value == 1 && enemy_stand_value == 1{
+                stand_check = true
+            }
+
+            if !bust_check && !blackjack_check && !stand_check && stand_value == 0 {
                 info!("Say 'draw card' to draw a card");
                 info!("Or Say 'stand' to stand");
                 info!("\n");
-            } else if (!bust_check && !blackjack_check) {
+            } else if (!bust_check && !blackjack_check && !stand_check) {
                 info!("You stand. Waiting for player to make a move")
+                info!("Say 'ping' to see enemy player action");
+            } else if (stand_check){
+                let player_score: i64 = get_score().await.expect("Get Player Score");
+
+                if enemy_score > player_score{
+                    info!("Enemy got a score of {}, You got a score of {}\nYOU LOSE!!", enemy_score, player_score);
+                    info!("Type restart to restart the game (Both Players must restart)");
+                } else if (player_score > enemy_score){
+                    info!("Enemy got a score of {}, You got a score of {}\nYOU WIN!!", enemy_score, player_score);
+                    info!("Type restart to restart the game (Both Players must restart)");
+                } else {
+                    info!("Enemy got a score of {}, You got a score of {}\nDRAW!!", enemy_score, player_score);
+                    info!("Type restart to restart the game (Both Players must restart)");
+                }
             }
-            info!("Say 'ping' twice to see enemy player action")
         } else {
             info!("Could not find another player\n\n");
-            info!("Say 'start' twice to start the game when another player is connected");
+            info!("Say 'start' to start the game when another player is connected");
         }
     }
 }
@@ -498,6 +528,7 @@ async fn handle_stand() {
 }
 
 async fn handle_ping_enemy(swarm: &mut Swarm<CardBehavior>) {
+    let _ = ping_enemy(swarm).await.expect("Pinged Enemy");
     let _ = ping_enemy(swarm).await.expect("Pinged Enemy");
 }
 
